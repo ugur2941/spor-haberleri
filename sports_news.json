@@ -1,0 +1,176 @@
+package com.sporhaberleri.data
+
+import android.util.Xml
+import com.sporhaberleri.BuildConfig
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import org.xmlpull.v1.XmlPullParser
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
+
+class SportsNewsRepository {
+
+    suspend fun loadNews(team: SportsTeam): Result<List<NewsArticle>> = withContext(Dispatchers.IO) {
+        runCatching {
+            loadFromGithubFeed(team).ifEmpty {
+                loadFromRss(team).ifEmpty {
+                    team.fallbackStories
+                }
+            }
+        }
+    }
+
+    private fun loadFromGithubFeed(team: SportsTeam): List<NewsArticle> {
+        val feedUrl = BuildConfig.SPORTS_NEWS_FEED_URL.trim()
+        if (feedUrl.isBlank()) return emptyList()
+
+        return runCatching {
+            val json = downloadText(feedUrl)
+            parseGithubFeed(json, team.displayName)
+        }.getOrDefault(emptyList())
+    }
+
+    private fun loadFromRss(team: SportsTeam): List<NewsArticle> {
+        return runCatching {
+            val rssUrl = buildGoogleNewsRssUrl(team.query)
+            val xml = downloadText(rssUrl)
+            parseRss(xml)
+        }.getOrDefault(emptyList())
+    }
+
+    private fun buildGoogleNewsRssUrl(query: String): String {
+        val encodedQuery = URLEncoder.encode(query, Charsets.UTF_8.name())
+        return "https://news.google.com/rss/search?q=$encodedQuery&hl=tr&gl=TR&ceid=TR:tr"
+    }
+
+    private fun downloadText(urlString: String): String {
+        val connection = (URL(urlString).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 10_000
+            readTimeout = 10_000
+            requestMethod = "GET"
+            setRequestProperty("User-Agent", "Mozilla/5.0")
+        }
+
+        return try {
+            connection.inputStream.bufferedReader().use { reader -> reader.readText() }
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun parseGithubFeed(json: String, teamName: String): List<NewsArticle> {
+        val root = JSONObject(json)
+        val teams = root.optJSONObject("teams") ?: return emptyList()
+        val items = teams.optJSONArray(teamName) ?: return emptyList()
+
+        return parseArticlesFromJsonArray(items).take(8)
+    }
+
+    private fun parseArticlesFromJsonArray(items: JSONArray): List<NewsArticle> {
+        val articles = mutableListOf<NewsArticle>()
+        for (index in 0 until items.length()) {
+            val item = items.optJSONObject(index) ?: continue
+            val title = item.optString("title").trim()
+            if (title.isBlank()) continue
+            articles += NewsArticle(
+                title = title,
+                summary = item.optString("summary").trim(),
+                source = item.optString("source", "Google News").ifBlank { "Google News" },
+                publishedLabel = item.optString("publishedLabel", "Son dakika").ifBlank { "Son dakika" },
+                link = item.optString("link").ifBlank { "https://news.google.com" },
+                imageUrl = item.optString("imageUrl").trim().ifBlank { null }
+            )
+        }
+        return articles.distinctBy { it.title }
+    }
+
+    private fun parseRss(xml: String): List<NewsArticle> {
+        val parser = Xml.newPullParser()
+        parser.setInput(xml.reader())
+
+        val items = mutableListOf<NewsArticle>()
+        var eventType = parser.eventType
+        var inItem = false
+        var title = ""
+        var link = ""
+        var description = ""
+        var source = "Google News"
+        var pubDate = ""
+        var imageUrl: String? = null
+
+        while (eventType != XmlPullParser.END_DOCUMENT) {
+            when (eventType) {
+                XmlPullParser.START_TAG -> when (parser.name) {
+                    "item" -> {
+                        inItem = true
+                        title = ""
+                        link = ""
+                        description = ""
+                        source = "Google News"
+                        pubDate = ""
+                        imageUrl = null
+                    }
+
+                    "title" -> if (inItem) title = parser.nextText().trim()
+                    "link" -> if (inItem) link = parser.nextText().trim()
+                    "description" -> if (inItem) description = parser.nextText().trim()
+                    "source" -> if (inItem) source = parser.nextText().trim()
+                    "pubDate" -> if (inItem) pubDate = parser.nextText().trim()
+                    "thumbnail", "content", "enclosure" -> {
+                        if (inItem && imageUrl == null) {
+                            val candidate = parser.getAttributeValue(null, "url")
+                                ?: parser.getAttributeValue("http://search.yahoo.com/mrss/", "url")
+                            if (!candidate.isNullOrBlank()) {
+                                imageUrl = candidate
+                            }
+                        }
+                    }
+                }
+
+                XmlPullParser.END_TAG -> {
+                    if (parser.name == "item" && title.isNotBlank()) {
+                        items += NewsArticle(
+                            title = title,
+                            summary = cleanDescription(description),
+                            source = if (source.isBlank()) "Google News" else source,
+                            publishedLabel = formatDate(pubDate),
+                            link = if (link.isBlank()) "https://news.google.com" else link,
+                            imageUrl = imageUrl
+                        )
+                        inItem = false
+                    }
+                }
+            }
+            eventType = parser.next()
+        }
+
+        return items.distinctBy { it.title }.take(8)
+    }
+
+    private fun cleanDescription(text: String): String {
+        return text
+            .replace(Regex("<[^>]+>"), " ")
+            .replace("&nbsp;", " ")
+            .replace("&amp;", "&")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+    }
+
+    private fun formatDate(value: String): String {
+        if (value.isBlank()) return "Son dakika"
+        val parser = SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss Z", Locale.ENGLISH)
+        val formatter = SimpleDateFormat("dd MMM HH:mm", Locale("tr", "TR"))
+        formatter.timeZone = TimeZone.getDefault()
+        return runCatching {
+            val parsed = parser.parse(value) ?: return@runCatching "Son dakika"
+            formatter.format(Date(parsed.time))
+        }.getOrDefault("Son dakika")
+    }
+}
